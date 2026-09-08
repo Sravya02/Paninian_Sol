@@ -12,408 +12,219 @@
 
 using namespace std;
 
-struct TelemetryRecord {
+struct Record {
     double timestamp{};
-    map<string, double> values;
-    map<string, bool> valid;
+    map<string,double> value;
+    map<string,bool> valid;
 };
 
-struct SensorConfig {
-    double physicalMin;
-    double physicalMax;
-    double operatingMin;
-    double operatingMax;
-    double trendThreshold;
+struct Config {
+    double physical_min, physical_max;
+    double threshold_min, threshold_max;
+    double trend_limit;
 };
 
-struct Anomaly {
+struct Finding {
     double timestamp{};
-    string sensor;
-    double value{};
-    string type;
-    string description;
+    string sensor, type, description;
+    double raw_value{}, filtered_value{};
 };
 
-struct Statistics {
-    size_t total{};
-    size_t valid{};
-    size_t missing{};
-    size_t anomalies{};
-    double minimum{};
-    double maximum{};
-    double average{};
+const vector<string> SENSORS = {
+    "temp_c","pressure_kpa","altitude_m",
+    "velocity_mps","vibration_g","accel_g"
 };
 
-const vector<string> SENSOR_NAMES = {
-    "temp_c", "pressure_kpa", "altitude_m",
-    "velocity_mps", "vibration_g", "accel_g"
+/*
+ * Screening limits are assignment limits, not certified aircraft limits.
+ * Threshold detection is performed on raw values so that the reported
+ * counts directly represent CSV samples. Trend detection uses filtered data.
+ */
+const map<string,Config> CONFIG = {
+    {"temp_c",       {-100,200, -numeric_limits<double>::infinity(),40, 5}},
+    {"pressure_kpa", {0,2000, -numeric_limits<double>::infinity(),numeric_limits<double>::infinity(), 0.50}},
+    {"altitude_m",   {-1000,50000, -numeric_limits<double>::infinity(),numeric_limits<double>::infinity(), 5.0}},
+    {"velocity_mps", {0,2000, -numeric_limits<double>::infinity(),350, 20}},
+    {"vibration_g",  {0,100, -numeric_limits<double>::infinity(),0.10, 0.03}},
+    {"accel_g",      {-100,100,0.90,1.10,0.10}}
 };
 
-const map<string, SensorConfig> CONFIG = {
-    {"temp_c",      {-100.0, 200.0, -50.0, 120.0, 5.0}},
-    {"pressure_kpa",{0.0, 2000.0, 100.0, 1200.0, 100.0}},
-    {"altitude_m",  {-1000.0, 50000.0, 0.0, 45000.0, 1000.0}},
-    {"velocity_mps",{0.0, 2000.0, 0.0, 1500.0, 100.0}},
-    {"vibration_g", {0.0, 100.0, 0.0, 50.0, 10.0}},
-    {"accel_g",     {-100.0, 100.0, -50.0, 50.0, 10.0}}
-};
-
-string trim(const string& s) {
-    const string ws = " \t\r\n";
-    const size_t first = s.find_first_not_of(ws);
-    if (first == string::npos) return "";
-    const size_t last = s.find_last_not_of(ws);
-    return s.substr(first, last - first + 1);
-}
-
-vector<string> splitCSV(const string& line) {
-    vector<string> fields;
-    string field;
-    bool quoted = false;
-
-    for (char c : line) {
-        if (c == '"') {
-            quoted = !quoted;
-        } else if (c == ',' && !quoted) {
-            fields.push_back(field);
-            field.clear();
-        } else {
-            field += c;
-        }
+vector<string> split_csv(const string& line) {
+    vector<string> fields; string field; bool quoted=false;
+    for(char c: line) {
+        if(c=='"') quoted=!quoted;
+        else if(c==',' && !quoted) { fields.push_back(field); field.clear(); }
+        else field += c;
     }
     fields.push_back(field);
     return fields;
 }
 
-bool parseNumber(const string& text, double& value) {
-    const string s = trim(text);
-    if (s.empty() || s == "NA" || s == "N/A" ||
-        s == "null" || s == "NULL") {
-        return false;
-    }
+string trim(string s) {
+    const string ws=" \t\r\n";
+    size_t a=s.find_first_not_of(ws);
+    if(a==string::npos) return "";
+    size_t b=s.find_last_not_of(ws);
+    return s.substr(a,b-a+1);
+}
 
+bool parse_number(const string& text, double& result) {
+    string s=trim(text);
+    if(s.empty() || s=="NA" || s=="N/A" || s=="null" || s=="NULL") return false;
     try {
-        size_t consumed = 0;
-        value = stod(s, &consumed);
-        return consumed == s.size() && isfinite(value);
-    } catch (...) {
-        return false;
-    }
+        size_t used=0;
+        result=stod(s,&used);
+        return used==s.size() && isfinite(result);
+    } catch(...) { return false; }
 }
 
-class CSVReader {
-public:
-    vector<TelemetryRecord> read(const string& filename) const {
-        ifstream input(filename);
-        if (!input) {
-            throw runtime_error("Cannot open input file: " + filename);
+vector<Record> read_csv(const string& filename) {
+    ifstream in(filename);
+    if(!in) throw runtime_error("Cannot open input file: "+filename);
+
+    string line;
+    if(!getline(in,line)) throw runtime_error("CSV is empty");
+    auto header=split_csv(line);
+    map<string,size_t> index;
+    for(size_t i=0;i<header.size();++i) index[trim(header[i])]=i;
+
+    for(const string& s: SENSORS)
+        if(!index.count(s)) throw runtime_error("Missing column: "+s);
+    if(!index.count("timestamp")) throw runtime_error("Missing column: timestamp");
+
+    vector<Record> records;
+    while(getline(in,line)) {
+        if(trim(line).empty()) continue;
+        auto fields=split_csv(line);
+        double t;
+        if(index["timestamp"]>=fields.size() ||
+           !parse_number(fields[index["timestamp"]],t)) {
+            cerr<<"Warning: corrupted timestamp row skipped\n";
+            continue;
         }
 
-        string line;
-        if (!getline(input, line)) {
-            throw runtime_error("Input CSV is empty.");
-        }
-
-        const vector<string> header = splitCSV(line);
-        map<string, size_t> index;
-
-        for (size_t i = 0; i < header.size(); ++i) {
-            index[trim(header[i])] = i;
-        }
-
-        if (!index.count("timestamp")) {
-            throw runtime_error("Required column 'timestamp' is missing.");
-        }
-
-        for (const string& sensor : SENSOR_NAMES) {
-            if (!index.count(sensor)) {
-                throw runtime_error("Required column '" + sensor + "' is missing.");
-            }
-        }
-
-        vector<TelemetryRecord> records;
-        size_t lineNumber = 1;
-
-        while (getline(input, line)) {
-            ++lineNumber;
-            if (trim(line).empty()) continue;
-
-            const vector<string> fields = splitCSV(line);
-            double timestamp{};
-
-            if (index["timestamp"] >= fields.size() ||
-                !parseNumber(fields[index["timestamp"]], timestamp)) {
-                cerr << "Warning: skipping invalid timestamp at line "
-                     << lineNumber << '\n';
-                continue;
-            }
-
-            TelemetryRecord record;
-            record.timestamp = timestamp;
-
-            for (const string& sensor : SENSOR_NAMES) {
-                const size_t column = index[sensor];
-                double value{};
-
-                if (column < fields.size() && parseNumber(fields[column], value)) {
-                    record.values[sensor] = value;
-                    record.valid[sensor] = true;
-                } else {
-                    record.values[sensor] =
-                        numeric_limits<double>::quiet_NaN();
-                    record.valid[sensor] = false;
-                }
-            }
-
-            records.push_back(record);
-        }
-
-        return records;
-    }
-};
-
-class DataValidator {
-public:
-    void validate(vector<TelemetryRecord>& records) const {
-        for (auto& record : records) {
-            for (const string& sensor : SENSOR_NAMES) {
-                if (!record.valid[sensor]) continue;
-
-                const auto& limits = CONFIG.at(sensor);
-                const double value = record.values[sensor];
-
-                if (value < limits.physicalMin ||
-                    value > limits.physicalMax) {
-                    cerr << "Warning: physically invalid " << sensor
-                         << " at timestamp " << record.timestamp << '\n';
-                    record.valid[sensor] = false;
-                    record.values[sensor] =
-                        numeric_limits<double>::quiet_NaN();
-                }
-            }
-        }
-    }
-};
-
-class MissingValueHandler {
-public:
-    void interpolate(vector<TelemetryRecord>& records) const {
-        for (const string& sensor : SENSOR_NAMES) {
-            for (size_t i = 0; i < records.size(); ++i) {
-                if (records[i].valid[sensor]) continue;
-
-                int previous = -1;
-                for (int j = static_cast<int>(i) - 1; j >= 0; --j) {
-                    if (records[j].valid[sensor]) {
-                        previous = j;
-                        break;
-                    }
-                }
-
-                size_t next = i + 1;
-                while (next < records.size() &&
-                       !records[next].valid[sensor]) {
-                    ++next;
-                }
-
-                if (previous >= 0 && next < records.size()) {
-                    const double t1 = records[previous].timestamp;
-                    const double t2 = records[next].timestamp;
-                    const double t = records[i].timestamp;
-                    const double v1 = records[previous].values[sensor];
-                    const double v2 = records[next].values[sensor];
-
-                    records[i].values[sensor] =
-                        (t2 == t1) ? v1 : v1 + (v2 - v1) * (t - t1) / (t2 - t1);
-                    records[i].valid[sensor] = true;
-                }
-            }
-        }
-    }
-};
-
-vector<double> movingAverage(const vector<double>& values, size_t window = 3) {
-    vector<double> result(values.size(), numeric_limits<double>::quiet_NaN());
-
-    for (size_t i = 0; i < values.size(); ++i) {
-        const size_t start = (i + 1 >= window) ? i + 1 - window : 0;
-        double sum = 0.0;
-        size_t count = 0;
-
-        for (size_t j = start; j <= i; ++j) {
-            if (isfinite(values[j])) {
-                sum += values[j];
-                ++count;
-            }
-        }
-
-        if (count > 0) result[i] = sum / static_cast<double>(count);
-    }
-    return result;
-}
-
-class AnomalyDetector {
-public:
-    vector<Anomaly> detect(const vector<TelemetryRecord>& records) const {
-        vector<Anomaly> anomalies;
-
-        for (const string& sensor : SENSOR_NAMES) {
-            vector<double> values;
-            values.reserve(records.size());
-
-            for (const auto& record : records) {
-                values.push_back(record.values.at(sensor));
-            }
-
-            const vector<double> filtered = movingAverage(values);
-            const auto& limits = CONFIG.at(sensor);
-
-            for (size_t i = 0; i < records.size(); ++i) {
-                if (!isfinite(filtered[i])) continue;
-
-                if (filtered[i] < limits.operatingMin ||
-                    filtered[i] > limits.operatingMax) {
-                    anomalies.push_back({
-                        records[i].timestamp, sensor, filtered[i],
-                        "THRESHOLD",
-                        "Filtered value outside operating limits"
-                    });
-                }
-
-                if (i > 0 && isfinite(filtered[i - 1]) &&
-                    abs(filtered[i] - filtered[i - 1]) > limits.trendThreshold) {
-                    anomalies.push_back({
-                        records[i].timestamp, sensor, filtered[i],
-                        "TREND",
-                        "Rapid change in filtered sensor value"
-                    });
-                }
-            }
-        }
-
-        return anomalies;
-    }
-};
-
-map<string, Statistics> calculateStatistics(
-    const vector<TelemetryRecord>& records,
-    const vector<Anomaly>& anomalies) {
-
-    map<string, Statistics> result;
-
-    for (const string& sensor : SENSOR_NAMES) {
-        Statistics stats;
-        stats.total = records.size();
-        double sum = 0.0;
-
-        for (const auto& record : records) {
-            if (record.valid.at(sensor) &&
-                isfinite(record.values.at(sensor))) {
-                const double value = record.values.at(sensor);
-
-                if (stats.valid == 0) {
-                    stats.minimum = value;
-                    stats.maximum = value;
-                } else {
-                    stats.minimum = min(stats.minimum, value);
-                    stats.maximum = max(stats.maximum, value);
-                }
-
-                sum += value;
-                ++stats.valid;
+        Record r; r.timestamp=t;
+        for(const string& s:SENSORS) {
+            double v;
+            size_t col=index[s];
+            if(col<fields.size() && parse_number(fields[col],v)) {
+                r.value[s]=v; r.valid[s]=true;
             } else {
-                ++stats.missing;
+                r.value[s]=numeric_limits<double>::quiet_NaN();
+                r.valid[s]=false;
             }
         }
-
-        if (stats.valid > 0) {
-            stats.average = sum / static_cast<double>(stats.valid);
-        }
-
-        for (const auto& anomaly : anomalies) {
-            if (anomaly.sensor == sensor) ++stats.anomalies;
-        }
-
-        result[sensor] = stats;
+        records.push_back(r);
     }
-
-    return result;
+    return records;
 }
 
-void writeReport(
-    const string& filename,
-    const map<string, Statistics>& statistics,
-    const vector<Anomaly>& anomalies) {
-
-    ofstream output(filename);
-    if (!output) {
-        throw runtime_error("Cannot create report file: " + filename);
-    }
-
-    output << "Sensor,Total Samples,Valid Samples,Missing Samples,"
-              "Minimum,Maximum,Average,Anomalies\n";
-    output << fixed << setprecision(3);
-
-    for (const auto& [sensor, stats] : statistics) {
-        output << sensor << ','
-               << stats.total << ','
-               << stats.valid << ','
-               << stats.missing << ','
-               << stats.minimum << ','
-               << stats.maximum << ','
-               << stats.average << ','
-               << stats.anomalies << '\n';
-    }
-
-    output << "\nTimestamp,Sensor,Value,Type,Description\n";
-    for (const auto& anomaly : anomalies) {
-        output << anomaly.timestamp << ','
-               << anomaly.sensor << ','
-               << anomaly.value << ','
-               << anomaly.type << ','
-               << anomaly.description << '\n';
+void validate(vector<Record>& records) {
+    for(auto& r:records) {
+        for(const string& s:SENSORS) {
+            if(!r.valid[s]) continue;
+            const auto& c=CONFIG.at(s);
+            if(r.value[s]<c.physical_min || r.value[s]>c.physical_max) {
+                r.valid[s]=false;
+                r.value[s]=numeric_limits<double>::quiet_NaN();
+            }
+        }
     }
 }
 
-int main(int argc, char* argv[]) {
-    if (argc < 2 || argc > 3) {
-        cerr << "Usage: " << argv[0]
-             << " <input.csv> [output_report.csv]\n";
-        return 1;
+void interpolate(vector<Record>& records) {
+    for(const string& s:SENSORS) {
+        for(size_t i=0;i<records.size();++i) {
+            if(records[i].valid[s]) continue;
+            int prev=-1;
+            for(int j=(int)i-1;j>=0;--j)
+                if(records[j].valid[s]) { prev=j; break; }
+            size_t next=i+1;
+            while(next<records.size() && !records[next].valid[s]) ++next;
+
+            if(prev>=0 && next<records.size()) {
+                double t1=records[prev].timestamp, t2=records[next].timestamp;
+                double v1=records[prev].value[s], v2=records[next].value[s];
+                records[i].value[s]=(t2==t1)?v1:v1+(v2-v1)*(records[i].timestamp-t1)/(t2-t1);
+                records[i].valid[s]=true;
+            }
+        }
     }
+}
 
-    const string inputFile = argv[1];
-    const string outputFile =
-        (argc == 3) ? argv[2] : "telemetry_report.csv";
+vector<double> moving_average(const vector<double>& x, size_t window=3) {
+    vector<double> y(x.size(),numeric_limits<double>::quiet_NaN());
+    for(size_t i=0;i<x.size();++i) {
+        double sum=0; size_t n=0;
+        size_t start=(i+1>=window)?i+1-window:0;
+        for(size_t j=start;j<=i;++j) if(isfinite(x[j])) {sum+=x[j];++n;}
+        if(n) y[i]=sum/n;
+    }
+    return y;
+}
 
+vector<Finding> detect(const vector<Record>& records) {
+    vector<Finding> findings;
+    for(const string& s:SENSORS) {
+        vector<double> raw;
+        for(const auto& r:records) raw.push_back(r.value.at(s));
+        auto filtered=moving_average(raw);
+
+        const auto& c=CONFIG.at(s);
+        for(size_t i=0;i<records.size();++i) {
+            if(!isfinite(raw[i])) continue;
+
+            if(raw[i]<c.threshold_min || raw[i]>c.threshold_max)
+                findings.push_back({records[i].timestamp,s,"THRESHOLD",
+                    "Raw value outside configured screening limit",raw[i],filtered[i]});
+
+            if(i>0 && isfinite(filtered[i]) && isfinite(filtered[i-1]) &&
+               fabs(filtered[i]-filtered[i-1])>c.trend_limit)
+                findings.push_back({records[i].timestamp,s,"TREND",
+                    "Rapid change in filtered sensor value",raw[i],filtered[i]});
+        }
+    }
+    return findings;
+}
+
+void write_report(const string& filename,const vector<Record>& records,
+                  const vector<Finding>& findings) {
+    ofstream out(filename);
+    if(!out) throw runtime_error("Cannot create report");
+    out<<"Sensor,Total Samples,Valid Samples,Missing Samples,Threshold Anomalies,Trend Anomalies,Total Findings\n";
+    for(const string& s:SENSORS) {
+        size_t valid=0, missing=0, th=0, tr=0;
+        for(const auto& r:records) r.valid.at(s)?++valid:++missing;
+        for(const auto& f:findings) if(f.sensor==s) f.type=="THRESHOLD"?++th:++tr;
+        out<<s<<','<<records.size()<<','<<valid<<','<<missing<<','<<th<<','<<tr<<','<<th+tr<<'\n';
+    }
+    out<<"\nTimestamp,Sensor,Raw Value,Filtered Value,Type,Description\n";
+    out<<fixed<<setprecision(3);
+    for(const auto& f:findings)
+        out<<f.timestamp<<','<<f.sensor<<','<<f.raw_value<<','<<f.filtered_value<<','<<f.type<<','<<f.description<<'\n';
+}
+
+int main(int argc,char* argv[]) {
+    if(argc<2 || argc>3) {
+        cerr<<"Usage: "<<argv[0]<<" input.csv [report.csv]\n"; return 1;
+    }
     try {
-        CSVReader reader;
-        auto records = reader.read(inputFile);
+        auto records=read_csv(argv[1]);
+        size_t original_missing=0;
+        for(const auto& r:records) for(const string& s:SENSORS) if(!r.valid.at(s)) ++original_missing;
 
-        if (records.empty()) {
-            throw runtime_error("No telemetry records were loaded.");
-        }
+        validate(records);
+        interpolate(records);
+        auto findings=detect(records);
+        string report=(argc==3)?argv[2]:"telemetry_report.csv";
+        write_report(report,records,findings);
 
-        DataValidator validator;
-        validator.validate(records);
-
-        MissingValueHandler missingHandler;
-        missingHandler.interpolate(records);
-
-        AnomalyDetector detector;
-        const auto anomalies = detector.detect(records);
-        const auto statistics = calculateStatistics(records, anomalies);
-
-        writeReport(outputFile, statistics, anomalies);
-
-        cout << "Telemetry analysis completed successfully.\n";
-        cout << "Records processed: " << records.size() << '\n';
-        cout << "Anomalies detected: " << anomalies.size() << '\n';
-        cout << "Report: " << outputFile << '\n';
-    } catch (const exception& error) {
-        cerr << "Error: " << error.what() << '\n';
-        return 1;
+        cout<<"Telemetry analysis completed successfully.\n";
+        cout<<"Records processed: "<<records.size()<<'\n';
+        cout<<"Original missing/corrupted sensor samples: "<<original_missing<<'\n';
+        cout<<"Total findings: "<<findings.size()<<'\n';
+        cout<<"Report: "<<report<<'\n';
+    } catch(const exception& e) {
+        cerr<<"Error: "<<e.what()<<'\n'; return 1;
     }
-
-    return 0;
 }
