@@ -27,11 +27,11 @@ Missing values may be represented by an empty field, NA, N/A, null, or NULL.
 
 Linux/macOS
 
-g++ -std=c++17 -Wall -Wextra -O2 telemetry_sol.cpp -o telemetry_analyzer
+g++ -std=c++17 -Wall -Wextra -O2 telemetry_sol.cpp -o telemetry_sol
 
 Windows with MinGW
 
-g++ -std=c++17 -Wall -Wextra -O2 telemetry_sol.cpp -o telemetry_analyzer.exe
+g++ -std=c++17 -Wall -Wextra -O2 telemetry_sol.cpp -o telemetry_sol.exe
 
 Windows with Visual Studio Developer Command Prompt
 
@@ -41,7 +41,7 @@ cl /std:c++17 /EHsc /O2 telemetry_sol.cpp
 
 Linux/macOS
 
-./telemetry_analyzer telemetry_data.csv
+./telemetry_sol telemetry_data.csv
 
 Windows
 
@@ -83,8 +83,8 @@ The report can be opened in Microsoft Excel, LibreOffice Calc, or any text edito
 
 Example
 
-g++ -std=c++17 -Wall -Wextra -O2 telemetry_analyzer.cpp -o telemetry_analyzer
-./telemetry_analyzer telemetry_data.csv telemetry_report.csv
+g++ -std=c++17 -Wall -Wextra -O2 telemetry_sol.cpp -o telemetry_analyzer
+./telemetry_sol telemetry_data.csv telemetry_report.csv
 
 **Expected console output format:**
 
