@@ -1,230 +1,720 @@
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <map>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
-using namespace std;
-
 struct Record {
     double timestamp{};
-    map<string,double> value;
-    map<string,bool> valid;
+    std::map<std::string, double> sensors;
+    std::map<std::string, bool> valid;
 };
 
 struct Config {
-    double physical_min, physical_max;
-    double threshold_min, threshold_max;
-    double trend_limit;
+    double physical_min{};
+    double physical_max{};
+    double threshold_min{};
+    double threshold_max{};
+    double trend_limit{};
 };
 
 struct Finding {
     double timestamp{};
-    string sensor, type, description;
-    double raw_value{}, filtered_value{};
+    std::string sensor;
+    std::string type;
+    std::string description;
+    double raw_value{};
+    double filtered_value{};
 };
 
-const vector<string> SENSORS = {
-    "temp_c","pressure_kpa","altitude_m",
-    "velocity_mps","vibration_g","accel_g"
+struct Diagnostic {
+    double timestamp{};
+    std::string category;
+    std::string message;
 };
 
-/*
- * Screening limits are assignment limits, not certified aircraft limits.
- * Threshold detection is performed on raw values so that the reported
- * counts directly represent CSV samples. Trend detection uses filtered data.
- */
-const map<string,Config> CONFIG = {
-    {"temp_c",       {-100,200, -numeric_limits<double>::infinity(),40, 5}},
-    {"pressure_kpa", {0,2000, -numeric_limits<double>::infinity(),numeric_limits<double>::infinity(), 0.50}},
-    {"altitude_m",   {-1000,50000, -numeric_limits<double>::infinity(),numeric_limits<double>::infinity(), 5.0}},
-    {"velocity_mps", {0,2000, -numeric_limits<double>::infinity(),350, 20}},
-    {"vibration_g",  {0,100, -numeric_limits<double>::infinity(),0.10, 0.03}},
-    {"accel_g",      {-100,100,0.90,1.10,0.10}}
+const std::vector<std::string> SENSORS = {
+    "temp_c",
+    "pressure_kpa",
+    "altitude_m",
+    "velocity_mps",
+    "vibration_g",
+    "accel_g"
 };
 
-vector<string> split_csv(const string& line) {
-    vector<string> fields; string field; bool quoted=false;
-    for(char c: line) {
-        if(c=='"') quoted=!quoted;
-        else if(c==',' && !quoted) { fields.push_back(field); field.clear(); }
-        else field += c;
+const std::map<std::string, Config> CONFIG = {
+    {"temp_c", {-100.0, 200.0, -std::numeric_limits<double>::infinity(), 40.0, 5.0}},
+    {"pressure_kpa", {0.0, 2000.0, -std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(), 0.50}},
+    {"altitude_m", {-1000.0, 50000.0, -std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(), 5.0}},
+    {"velocity_mps", {0.0, 2000.0, -std::numeric_limits<double>::infinity(), 350.0, 20.0}},
+    {"vibration_g", {0.0, 100.0, -std::numeric_limits<double>::infinity(), 0.10, 0.03}},
+    {"accel_g", {-100.0, 100.0, 0.90, 1.10, 0.10}}
+};
+
+std::vector<Diagnostic> diagnostics;
+
+std::string trim(const std::string& value) {
+    const std::size_t start = value.find_first_not_of(" \t\r\n");
+    if (start == std::string::npos) {
+        return "";
     }
-    fields.push_back(field);
+
+    const std::size_t end = value.find_last_not_of(" \t\r\n");
+    return value.substr(start, end - start + 1);
+}
+
+std::vector<std::string> split_csv(const std::string& line) {
+    std::vector<std::string> fields;
+    std::stringstream stream(line);
+    std::string field;
+
+    while (std::getline(stream, field, ',')) {
+        fields.push_back(trim(field));
+    }
+
+    if (!line.empty() && line.back() == ',') {
+        fields.emplace_back();
+    }
+
     return fields;
 }
 
-string trim(string s) {
-    const string ws=" \t\r\n";
-    size_t a=s.find_first_not_of(ws);
-    if(a==string::npos) return "";
-    size_t b=s.find_last_not_of(ws);
-    return s.substr(a,b-a+1);
+double parse_number(const std::string& text) {
+    const std::string value = trim(text);
+
+    if (value.empty()) {
+        throw std::runtime_error("Empty numeric value");
+    }
+
+    std::size_t position = 0;
+    const double result = std::stod(value, &position);
+
+    if (position != value.size()) {
+        throw std::runtime_error("Invalid numeric value: " + value);
+    }
+
+    if (!std::isfinite(result)) {
+        throw std::runtime_error("Non-finite numeric value: " + value);
+    }
+
+    return result;
 }
 
-bool parse_number(const string& text, double& result) {
-    string s=trim(text);
-    if(s.empty() || s=="NA" || s=="N/A" || s=="null" || s=="NULL") return false;
-    try {
-        size_t used=0;
-        result=stod(s,&used);
-        return used==s.size() && isfinite(result);
-    } catch(...) { return false; }
+bool is_missing(const std::string& value) {
+    const std::string normalized = trim(value);
+
+    return normalized.empty() ||
+           normalized == "NA" ||
+           normalized == "N/A" ||
+           normalized == "null" ||
+           normalized == "NULL";
 }
 
-vector<Record> read_csv(const string& filename) {
-    ifstream in(filename);
-    if(!in) throw runtime_error("Cannot open input file: "+filename);
+bool valid_config(const Config& config) {
+    return config.physical_min <= config.physical_max &&
+           config.threshold_min <= config.threshold_max &&
+           config.trend_limit >= 0.0;
+}
 
-    string line;
-    if(!getline(in,line)) throw runtime_error("CSV is empty");
-    auto header=split_csv(line);
-    map<string,size_t> index;
-    for(size_t i=0;i<header.size();++i) index[trim(header[i])]=i;
+void validate_config() {
+    for (const auto& item : CONFIG) {
+        if (!valid_config(item.second)) {
+            throw std::runtime_error(
+                "Invalid configuration for sensor: " + item.first
+            );
+        }
+    }
+}
 
-    for(const string& s: SENSORS)
-        if(!index.count(s)) throw runtime_error("Missing column: "+s);
-    if(!index.count("timestamp")) throw runtime_error("Missing column: timestamp");
+std::vector<Record> read_csv(
+    const std::string& filename,
+    std::size_t& original_missing
+) {
+    std::ifstream file(filename);
 
-    vector<Record> records;
-    while(getline(in,line)) {
-        if(trim(line).empty()) continue;
-        auto fields=split_csv(line);
-        double t;
-        if(index["timestamp"]>=fields.size() ||
-           !parse_number(fields[index["timestamp"]],t)) {
-            cerr<<"Warning: corrupted timestamp row skipped\n";
+    if (!file.is_open()) {
+        throw std::runtime_error("Unable to open input file: " + filename);
+    }
+
+    std::string line;
+
+    if (!std::getline(file, line)) {
+        throw std::runtime_error("Input file is empty");
+    }
+
+    const std::vector<std::string> header = split_csv(line);
+
+    if (header.size() != SENSORS.size() + 1 ||
+        header[0] != "timestamp") {
+        throw std::runtime_error("Invalid CSV header");
+    }
+
+    for (std::size_t i = 0; i < SENSORS.size(); ++i) {
+        if (header[i + 1] != SENSORS[i]) {
+            throw std::runtime_error("Unexpected CSV column: " + header[i + 1]);
+        }
+    }
+
+    std::vector<Record> records;
+    std::size_t line_number = 1;
+
+    while (std::getline(file, line)) {
+        ++line_number;
+
+        if (trim(line).empty()) {
             continue;
         }
 
-        Record r; r.timestamp=t;
-        for(const string& s:SENSORS) {
-            double v;
-            size_t col=index[s];
-            if(col<fields.size() && parse_number(fields[col],v)) {
-                r.value[s]=v; r.valid[s]=true;
-            } else {
-                r.value[s]=numeric_limits<double>::quiet_NaN();
-                r.valid[s]=false;
+        const std::vector<std::string> fields = split_csv(line);
+
+        if (fields.size() != SENSORS.size() + 1) {
+            diagnostics.push_back({
+                0.0,
+                "parser",
+                "Invalid column count at line " +
+                    std::to_string(line_number)
+            });
+            continue;
+        }
+
+        Record record;
+
+        try {
+            record.timestamp = parse_number(fields[0]);
+        } catch (const std::exception& error) {
+            diagnostics.push_back({
+                0.0,
+                "parser",
+                "Invalid timestamp at line " +
+                    std::to_string(line_number) +
+                    ": " + error.what()
+            });
+            continue;
+        }
+
+        bool record_valid = true;
+
+        for (std::size_t i = 0; i < SENSORS.size(); ++i) {
+            const std::string& sensor = SENSORS[i];
+
+            if (is_missing(fields[i + 1])) {
+                record.valid[sensor] = false;
+                record.sensors[sensor] = 0.0;
+                ++original_missing;
+                record_valid = false;
+                continue;
+            }
+
+            try {
+                record.sensors[sensor] = parse_number(fields[i + 1]);
+                record.valid[sensor] = true;
+            } catch (const std::exception& error) {
+                record.valid[sensor] = false;
+                record.sensors[sensor] = 0.0;
+                ++original_missing;
+                record_valid = false;
+
+                diagnostics.push_back({
+                    record.timestamp,
+                    "parser",
+                    "Invalid value for " + sensor +
+                        ": " + error.what()
+                });
             }
         }
-        records.push_back(r);
+
+        if (!record_valid) {
+            diagnostics.push_back({
+                record.timestamp,
+                "validation",
+                "Record contains missing or invalid sensor values"
+            });
+        }
+
+        records.push_back(record);
     }
+
+    if (records.empty()) {
+        throw std::runtime_error("No valid records found");
+    }
+
     return records;
 }
 
-void validate(vector<Record>& records) {
-    for(auto& r:records) {
-        for(const string& s:SENSORS) {
-            if(!r.valid[s]) continue;
-            const auto& c=CONFIG.at(s);
-            if(r.value[s]<c.physical_min || r.value[s]>c.physical_max) {
-                r.valid[s]=false;
-                r.value[s]=numeric_limits<double>::quiet_NaN();
+void validate_timestamps(const std::vector<Record>& records) {
+    std::set<double> timestamps;
+
+    for (std::size_t i = 0; i < records.size(); ++i) {
+        const double timestamp = records[i].timestamp;
+
+        if (!std::isfinite(timestamp)) {
+            diagnostics.push_back({
+                timestamp,
+                "timestamp",
+                "Timestamp is not finite"
+            });
+        }
+
+        if (timestamps.find(timestamp) != timestamps.end()) {
+            diagnostics.push_back({
+                timestamp,
+                "timestamp",
+                "Duplicate timestamp detected"
+            });
+        }
+
+        timestamps.insert(timestamp);
+
+        if (i > 0 && timestamp < records[i - 1].timestamp) {
+            diagnostics.push_back({
+                timestamp,
+                "timestamp",
+                "Out-of-order timestamp detected"
+            });
+        }
+    }
+}
+
+void validate_records(std::vector<Record>& records) {
+    for (Record& record : records) {
+        for (const std::string& sensor : SENSORS) {
+            if (!record.valid[sensor]) {
+                continue;
+            }
+
+            const Config& config = CONFIG.at(sensor);
+            const double value = record.sensors[sensor];
+
+            if (!std::isfinite(value)) {
+                record.valid[sensor] = false;
+
+                diagnostics.push_back({
+                    record.timestamp,
+                    sensor,
+                    "Non-finite sensor value"
+                });
+
+                continue;
+            }
+
+            if (value < config.physical_min ||
+                value > config.physical_max) {
+                record.valid[sensor] = false;
+
+                diagnostics.push_back({
+                    record.timestamp,
+                    sensor,
+                    "Value outside physical range"
+                });
             }
         }
     }
 }
 
-void interpolate(vector<Record>& records) {
-    for(const string& s:SENSORS) {
-        for(size_t i=0;i<records.size();++i) {
-            if(records[i].valid[s]) continue;
-            int prev=-1;
-            for(int j=(int)i-1;j>=0;--j)
-                if(records[j].valid[s]) { prev=j; break; }
-            size_t next=i+1;
-            while(next<records.size() && !records[next].valid[s]) ++next;
+bool interpolate(
+    std::vector<Record>& records,
+    const std::string& sensor
+) {
+    bool changed = false;
 
-            if(prev>=0 && next<records.size()) {
-                double t1=records[prev].timestamp, t2=records[next].timestamp;
-                double v1=records[prev].value[s], v2=records[next].value[s];
-                records[i].value[s]=(t2==t1)?v1:v1+(v2-v1)*(records[i].timestamp-t1)/(t2-t1);
-                records[i].valid[s]=true;
+    for (std::size_t i = 0; i < records.size(); ++i) {
+        if (records[i].valid[sensor]) {
+            continue;
+        }
+
+        std::size_t previous = i;
+        std::size_t next = i;
+
+        while (previous > 0) {
+            --previous;
+
+            if (records[previous].valid[sensor]) {
+                break;
             }
         }
+
+        while (next + 1 < records.size()) {
+            ++next;
+
+            if (records[next].valid[sensor]) {
+                break;
+            }
+        }
+
+        if (!records[previous].valid[sensor] ||
+            !records[next].valid[sensor] ||
+            previous == i ||
+            next == i) {
+            diagnostics.push_back({
+                records[i].timestamp,
+                sensor,
+                "Unable to interpolate missing value"
+            });
+            continue;
+        }
+
+        const double t1 = records[previous].timestamp;
+        const double t2 = records[next].timestamp;
+
+        if (t2 <= t1) {
+            diagnostics.push_back({
+                records[i].timestamp,
+                sensor,
+                "Interpolation rejected because timestamps are not increasing"
+            });
+            continue;
+        }
+
+        const double v1 = records[previous].sensors[sensor];
+        const double v2 = records[next].sensors[sensor];
+        const double t = records[i].timestamp;
+
+        const double value =
+            v1 + ((v2 - v1) / (t2 - t1)) * (t - t1);
+
+        const Config& config = CONFIG.at(sensor);
+
+        if (!std::isfinite(value) ||
+            value < config.physical_min ||
+            value > config.physical_max) {
+            diagnostics.push_back({
+                records[i].timestamp,
+                sensor,
+                "Interpolated value rejected"
+            });
+            continue;
+        }
+
+        records[i].sensors[sensor] = value;
+        records[i].valid[sensor] = true;
+        changed = true;
+
+        diagnostics.push_back({
+            records[i].timestamp,
+            sensor,
+            "Missing value interpolated"
+        });
     }
+
+    return changed;
 }
 
-vector<double> moving_average(const vector<double>& x, size_t window=3) {
-    vector<double> y(x.size(),numeric_limits<double>::quiet_NaN());
-    for(size_t i=0;i<x.size();++i) {
-        double sum=0; size_t n=0;
-        size_t start=(i+1>=window)?i+1-window:0;
-        for(size_t j=start;j<=i;++j) if(isfinite(x[j])) {sum+=x[j];++n;}
-        if(n) y[i]=sum/n;
+std::vector<double> moving_average(
+    const std::vector<double>& values,
+    std::size_t window
+) {
+    if (window == 0) {
+        throw std::runtime_error("Moving-average window cannot be zero");
     }
-    return y;
+
+    std::vector<double> result(values.size());
+
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        const std::size_t start =
+            i >= window - 1 ? i - window + 1 : 0;
+
+        double sum = 0.0;
+        std::size_t count = 0;
+
+        for (std::size_t j = start; j <= i; ++j) {
+            sum += values[j];
+            ++count;
+        }
+
+        result[i] = sum / static_cast<double>(count);
+    }
+
+    return result;
 }
 
-vector<Finding> detect(const vector<Record>& records) {
-    vector<Finding> findings;
-    for(const string& s:SENSORS) {
-        vector<double> raw;
-        for(const auto& r:records) raw.push_back(r.value.at(s));
-        auto filtered=moving_average(raw);
+bool violates_threshold(
+    double value,
+    const Config& config
+) {
+    return value < config.threshold_min ||
+           value > config.threshold_max;
+}
 
-        const auto& c=CONFIG.at(s);
-        for(size_t i=0;i<records.size();++i) {
-            if(!isfinite(raw[i])) continue;
+std::vector<Finding> detect(
+    const std::vector<Record>& records
+) {
+    std::vector<Finding> findings;
 
-            if(raw[i]<c.threshold_min || raw[i]>c.threshold_max)
-                findings.push_back({records[i].timestamp,s,"THRESHOLD",
-                    "Raw value outside configured screening limit",raw[i],filtered[i]});
+    for (const std::string& sensor : SENSORS) {
+        std::vector<double> values;
+        std::vector<double> filtered;
 
-            if(i>0 && isfinite(filtered[i]) && isfinite(filtered[i-1]) &&
-               fabs(filtered[i]-filtered[i-1])>c.trend_limit)
-                findings.push_back({records[i].timestamp,s,"TREND",
-                    "Rapid change in filtered sensor value",raw[i],filtered[i]});
+        for (const Record& record : records) {
+            if (record.valid.at(sensor)) {
+                values.push_back(record.sensors.at(sensor));
+            } else {
+                values.push_back(std::numeric_limits<double>::quiet_NaN());
+            }
+        }
+
+        std::vector<double> valid_values;
+
+        for (double value : values) {
+            if (std::isfinite(value)) {
+                valid_values.push_back(value);
+            }
+        }
+
+        if (valid_values.empty()) {
+            continue;
+        }
+
+        filtered = moving_average(valid_values, 3);
+
+        const Config& config = CONFIG.at(sensor);
+
+        std::size_t filtered_index = 0;
+
+        for (std::size_t i = 0; i < records.size(); ++i) {
+            if (!records[i].valid.at(sensor)) {
+                continue;
+            }
+
+            const double raw_value = records[i].sensors.at(sensor);
+            const double filtered_value = filtered[filtered_index];
+
+            if (violates_threshold(raw_value, config)) {
+                findings.push_back({
+                    records[i].timestamp,
+                    sensor,
+                    "Threshold",
+                    "Raw value outside configured threshold",
+                    raw_value,
+                    filtered_value
+                });
+            }
+
+            if (filtered_index > 0) {
+                const double previous = filtered[filtered_index - 1];
+                const double delta = filtered_value - previous;
+
+                if (std::abs(delta) > config.trend_limit) {
+                    findings.push_back({
+                        records[i].timestamp,
+                        sensor,
+                        "Trend",
+                        "Filtered value changed beyond configured trend limit",
+                        raw_value,
+                        filtered_value
+                    });
+                }
+            }
+
+            ++filtered_index;
         }
     }
+
     return findings;
 }
 
-void write_report(const string& filename,const vector<Record>& records,
-                  const vector<Finding>& findings) {
-    ofstream out(filename);
-    if(!out) throw runtime_error("Cannot create report");
-    out<<"Sensor,Total Samples,Valid Samples,Missing Samples,Threshold Anomalies,Trend Anomalies,Total Findings\n";
-    for(const string& s:SENSORS) {
-        size_t valid=0, missing=0, th=0, tr=0;
-        for(const auto& r:records) r.valid.at(s)?++valid:++missing;
-        for(const auto& f:findings) if(f.sensor==s) f.type=="THRESHOLD"?++th:++tr;
-        out<<s<<','<<records.size()<<','<<valid<<','<<missing<<','<<th<<','<<tr<<','<<th+tr<<'\n';
+void write_report(
+    const std::string& filename,
+    const std::vector<Finding>& findings
+) {
+    std::ofstream file(filename);
+
+    if (!file.is_open()) {
+        throw std::runtime_error("Unable to open report file");
     }
-    out<<"\nTimestamp,Sensor,Raw Value,Filtered Value,Type,Description\n";
-    out<<fixed<<setprecision(3);
-    for(const auto& f:findings)
-        out<<f.timestamp<<','<<f.sensor<<','<<f.raw_value<<','<<f.filtered_value<<','<<f.type<<','<<f.description<<'\n';
+
+    file << "timestamp,sensor,type,description,raw_value,filtered_value\n";
+
+    file << std::fixed << std::setprecision(6);
+
+    for (const Finding& finding : findings) {
+        file << finding.timestamp << ','
+             << finding.sensor << ','
+             << finding.type << ','
+             << finding.description << ','
+             << finding.raw_value << ','
+             << finding.filtered_value << '\n';
+    }
 }
 
-int main(int argc,char* argv[]) {
-    if(argc<2 || argc>3) {
-        cerr<<"Usage: "<<argv[0]<<" input.csv [report.csv]\n"; return 1;
+void write_diagnostic_report(
+    const std::string& filename
+) {
+    std::ofstream file(filename);
+
+    if (!file.is_open()) {
+        throw std::runtime_error("Unable to open diagnostic report");
     }
+
+    file << "timestamp,category,message\n";
+    file << std::fixed << std::setprecision(6);
+
+    for (const Diagnostic& diagnostic : diagnostics) {
+        file << diagnostic.timestamp << ','
+             << diagnostic.category << ','
+             << diagnostic.message << '\n';
+    }
+}
+
+void test_parse_number() {
+    assert(parse_number("10.5") == 10.5);
+    assert(parse_number(" 20 ") == 20.0);
+
+    bool failed = false;
+
     try {
-        auto records=read_csv(argv[1]);
-        size_t original_missing=0;
-        for(const auto& r:records) for(const string& s:SENSORS) if(!r.valid.at(s)) ++original_missing;
+        parse_number("abc");
+    } catch (...) {
+        failed = true;
+    }
 
-        validate(records);
-        interpolate(records);
-        auto findings=detect(records);
-        string report=(argc==3)?argv[2]:"telemetry_report.csv";
-        write_report(report,records,findings);
+    assert(failed);
+}
 
-        cout<<"Telemetry analysis completed successfully.\n";
-        cout<<"Records processed: "<<records.size()<<'\n';
-        cout<<"Original missing/corrupted sensor samples: "<<original_missing<<'\n';
-        cout<<"Total findings: "<<findings.size()<<'\n';
-        cout<<"Report: "<<report<<'\n';
-    } catch(const exception& e) {
-        cerr<<"Error: "<<e.what()<<'\n'; return 1;
+void test_split_csv() {
+    const std::vector<std::string> result =
+        split_csv("1, 2, 3");
+
+    assert(result.size() == 3);
+    assert(result[0] == "1");
+    assert(result[1] == "2");
+    assert(result[2] == "3");
+}
+
+void test_moving_average() {
+    const std::vector<double> values = {1.0, 2.0, 3.0};
+    const std::vector<double> result =
+        moving_average(values, 3);
+
+    assert(result.size() == 3);
+    assert(result[0] == 1.0);
+    assert(result[1] == 1.5);
+    assert(result[2] == 2.0);
+}
+
+void test_interpolation() {
+    std::vector<Record> records(3);
+
+    records[0].timestamp = 0.0;
+    records[1].timestamp = 1.0;
+    records[2].timestamp = 2.0;
+
+    records[0].sensors["temp_c"] = 10.0;
+    records[2].sensors["temp_c"] = 30.0;
+
+    records[0].valid["temp_c"] = true;
+    records[1].valid["temp_c"] = false;
+    records[2].valid["temp_c"] = true;
+
+    interpolate(records, "temp_c");
+
+    assert(records[1].valid["temp_c"]);
+    assert(records[1].sensors["temp_c"] == 20.0);
+}
+
+void test_threshold_detection() {
+    Config config;
+    config.threshold_min = 0.0;
+    config.threshold_max = 10.0;
+
+    assert(!violates_threshold(0.0, config));
+    assert(!violates_threshold(10.0, config));
+    assert(violates_threshold(-0.1, config));
+    assert(violates_threshold(10.1, config));
+}
+
+void test_timestamp_validation() {
+    diagnostics.clear();
+
+    std::vector<Record> records(3);
+
+    records[0].timestamp = 1.0;
+    records[1].timestamp = 1.0;
+    records[2].timestamp = 0.5;
+
+    validate_timestamps(records);
+
+    assert(diagnostics.size() == 2);
+}
+
+void run_unit_tests() {
+    diagnostics.clear();
+
+    test_parse_number();
+    test_split_csv();
+    test_moving_average();
+    test_interpolation();
+    test_threshold_detection();
+    test_timestamp_validation();
+
+    std::cout << "Unit tests passed\n";
+}
+
+int main(int argc, char* argv[]) {
+    try {
+        if (argc == 2 &&
+            std::string(argv[1]) == "--self-test") {
+            run_unit_tests();
+            return 0;
+        }
+
+        if (argc < 2 || argc > 4) {
+            std::cerr
+                << "Usage: " << argv[0]
+                << " input.csv [report.csv] [diagnostics.csv]\n";
+            return 1;
+        }
+
+        validate_config();
+
+        const std::string input_file = argv[1];
+
+        const std::string report_file =
+            argc >= 3 ? argv[2] : "telemetry_report.csv";
+
+        const std::string diagnostic_file =
+            argc >= 4 ? argv[3] : "telemetry_diagnostics.csv";
+
+        std::size_t original_missing = 0;
+
+        std::vector<Record> records =
+            read_csv(input_file, original_missing);
+
+        validate_timestamps(records);
+        validate_records(records);
+
+        for (const std::string& sensor : SENSORS) {
+            interpolate(records, sensor);
+        }
+
+        const std::vector<Finding> findings =
+            detect(records);
+
+        write_report(report_file, findings);
+        write_diagnostic_report(diagnostic_file);
+
+        std::cout << "Analysis completed successfully\n";
+        std::cout << "Records processed: "
+                  << records.size() << '\n';
+        std::cout << "Original missing samples: "
+                  << original_missing << '\n';
+        std::cout << "Findings generated: "
+                  << findings.size() << '\n';
+        std::cout << "Report: "
+                  << report_file << '\n';
+        std::cout << "Diagnostics: "
+                  << diagnostic_file << '\n';
+
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << "Error: " << error.what() << '\n';
+        return 1;
     }
 }
